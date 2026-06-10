@@ -33,7 +33,8 @@ import {
 } from '../../common/application-event.js'
 import Bridge from '../../common/bridge.js'
 import type UnexpectedErrorHandler from '../../common/unexpected-error-handler.js'
-import type { User } from '../../common/user'
+import type { DiscordUser, MinecraftUser, User } from '../../common/user'
+import { DiscordChatFormat } from '../../core/discord/discord-configurations'
 import MinecraftRenderer from '../../utility/minecraft-renderer'
 import { beautifyInstanceName } from '../../utility/shared-utility'
 
@@ -98,45 +99,152 @@ export default class DiscordBridge extends Bridge<DiscordInstance> {
   }
 
   async onChat(event: ChatEvent): Promise<void> {
+    const config = this.application.core.discordConfigurations
     const channels = this.resolveChannels([event.channelType])
     const username = event.user.displayName()
 
     for (const channelId of channels) {
       if (event.instanceType === InstanceType.Discord && channelId === event.channelId) continue
 
-      if (
-        event.instanceType === InstanceType.Minecraft &&
-        this.minecraftRenderImageEnabled() &&
-        MinecraftRenderer.renderSupported()
-      ) {
-        const formattedMessage = this.removeGuildPrefix(event.rawMessage)
-        const image = MinecraftRenderer.generateMessageImage(formattedMessage)
-        await this.sendImageToChannels(event.eventId, [channelId], [image])
-      } else {
-        const webhook = await this.getWebhook(channelId)
-
-        let displayUsername =
-          event.instanceType === InstanceType.Discord && event.replyUsername !== undefined
-            ? `${username}⇾${event.replyUsername}`
-            : username
-
-        if (this.application.core.applicationConfigurations.getOriginTag()) {
-          displayUsername += event.instanceType === InstanceType.Discord ? ` [DC]` : ` [${event.instanceName}]`
+      const chatFormat = config.getChatFormat()
+      switch (chatFormat) {
+        case DiscordChatFormat.MinecraftRender: {
+          if (
+            event.instanceType === InstanceType.Minecraft &&
+            this.minecraftRenderImageEnabled() &&
+            MinecraftRenderer.renderSupported()
+          ) {
+            const formattedMessage = this.removeGuildPrefix(event.rawMessage)
+            const image = MinecraftRenderer.generateMessageImage(formattedMessage)
+            await this.sendImageToChannels(event.eventId, [channelId], [image])
+          } else {
+            // default fallback
+            await this.sendAsWebhook(event, channelId, username)
+          }
+          break
         }
-
-        const message = await webhook.send({
-          content: escapeMarkdown(event.message),
-          username: displayUsername,
-          avatarURL: event.user.avatar(),
-          allowedMentions: { parse: [] }
-        })
-        this.messageAssociation.addMessageId(event.eventId, {
-          guildId: message.guildId,
-          channelId: message.channelId,
-          messageId: message.id
-        })
+        case DiscordChatFormat.Webhook: {
+          await this.sendAsWebhook(event, channelId, username)
+          break
+        }
+        case DiscordChatFormat.Embed: {
+          await this.sendAsEmbed(event, channelId, username)
+          break
+        }
+        default: {
+          chatFormat satisfies never
+          // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
+          assert.fail(`unknown chat format: ${chatFormat}`)
+        }
       }
     }
+  }
+
+  private async sendAsEmbed(event: ChatEvent, channelId: string, username: string): Promise<void> {
+    const displayUsername = username
+
+    const embedFooters: string[] = []
+    switch (event.channelType) {
+      case ChannelType.Private: {
+        // do nothing
+        break
+      }
+      case ChannelType.Public:
+      case ChannelType.Officer: {
+        if (event.instanceType === InstanceType.Minecraft) embedFooters.push(event.guildRank)
+        break
+      }
+      default: {
+        event satisfies never
+        assert.fail(`Unknown chat channelType from ${JSON.stringify(event)}`)
+      }
+    }
+
+    if (this.application.core.applicationConfigurations.getOriginTag()) {
+      embedFooters.push(event.instanceName)
+    }
+
+    const channel = await this.clientInstance.getClient().channels.fetch(channelId)
+    assert.ok(channel != undefined)
+    assert.ok(channel.isSendable())
+    const message = await channel.send({
+      embeds: [
+        {
+          description: escapeMarkdown(event.message),
+          color: this.getColorFromUUID(event.user),
+          timestamp: new Date().toISOString(),
+          footer: embedFooters.length > 0 ? { text: embedFooters.join(' • ') } : undefined,
+          author: {
+            name: displayUsername,
+            // eslint-disable-next-line @typescript-eslint/naming-convention
+            icon_url: event.user.avatar()
+          }
+        }
+      ]
+    })
+    this.messageAssociation.addMessageId(event.eventId, {
+      guildId: message.guildId ?? undefined,
+      channelId: message.channelId,
+      messageId: message.id
+    })
+  }
+
+  /**
+   * Creates a color from either the Minecraft UUID, Discord ID, or pseudo-random generation.
+   * @returns a color for the embed
+   */
+  private getColorFromUUID(user: MinecraftUser | DiscordUser | User): number {
+    const id = user.getUserIdentifier()
+    switch (id.originInstance)
+    {
+      case InstanceType.Minecraft:
+        const uuid = id.userId
+        const parsed = uuid.replace(/-/g, '')
+        const h = parseInt(parsed.slice(0, 4), 16) % 360;
+        const s = 55 + (parseInt(parsed.slice(4, 6), 16) % 26);
+        const l = 45 + (parseInt(parsed.slice(6, 8), 16) % 16);
+
+        const channel = (n: number): number => {
+          const k = (n + h / 30) % 12;
+          const ln = l / 100;
+          return ln - ((s / 100) * Math.min(ln, 1 - ln)) * Math.max(-1, Math.min(k - 3, 9 - k, 1))
+        }
+
+        return (Math.round(channel(0) * 255) << 16) | (Math.round(channel(8) * 255)) | Math.round(channel(4) * 255);
+      case InstanceType.Discord:
+        const discId = id.userId
+        return Number(BigInt(discId) % 16_777_216n)
+      default:
+        // fallback: randomness
+        const min = Math.ceil(0)
+        const max = Math.floor(16_777_215)
+        return Math.floor(Math.random() * (max - min + 1)) + min
+    }
+  }
+
+  private async sendAsWebhook(event: ChatEvent, channelId: string, username: string): Promise<void> {
+    const webhook = await this.getWebhook(channelId)
+
+    let displayUsername =
+      event.instanceType === InstanceType.Discord && event.replyUsername !== undefined
+        ? `${username}⇾${event.replyUsername}`
+        : username
+
+    if (this.application.core.applicationConfigurations.getOriginTag()) {
+      displayUsername += event.instanceType === InstanceType.Discord ? ` [DC]` : ` [${event.instanceName}]`
+    }
+
+    const message = await webhook.send({
+      content: escapeMarkdown(event.message),
+      username: displayUsername,
+      avatarURL: event.user.avatar(),
+      allowedMentions: { parse: [] }
+    })
+    this.messageAssociation.addMessageId(event.eventId, {
+      guildId: message.guildId,
+      channelId: message.channelId,
+      messageId: message.id
+    })
   }
 
   async onGuildPlayer(event: GuildPlayerEvent): Promise<void> {
@@ -169,10 +277,12 @@ export default class DiscordBridge extends Bridge<DiscordInstance> {
       let messageBody = escapeMarkdown(withoutPrefix)
 
       const targetUser = event.user
+      let playerHead = ""
       if (targetUser !== undefined) {
         const username = targetUser.displayName()
         const clickableUsername = hyperlink(username, targetUser.profileLink())
         messageBody = messageBody.replaceAll(escapeMarkdown(username), clickableUsername)
+        playerHead = targetUser.avatar()
       }
 
       const responsibleUser = 'responsible' in event ? event.responsible : undefined
@@ -182,11 +292,15 @@ export default class DiscordBridge extends Bridge<DiscordInstance> {
         messageBody = messageBody.replaceAll(escapeMarkdown(username), clickableUsername)
       }
 
+      // Tyg: here is the creation of the GuildPlayerEvent embed
       const newMessage = `**${escapeMarkdown(event.instanceName)} >** ${messageBody}`
       return {
         url: targetUser?.profileLink() ?? responsibleUser?.profileLink() ?? undefined,
         description: newMessage,
-        color: event.color
+        color: event.color,
+        author: playerHead != "" ? {
+          icon_url: playerHead
+        } : undefined
       } satisfies APIEmbed
     }
 
@@ -656,7 +770,7 @@ export default class DiscordBridge extends Bridge<DiscordInstance> {
 
   private minecraftRenderImageEnabled(): boolean {
     const config = this.application.core.discordConfigurations
-    return config.getTextToImage()
+    return config.getChatFormat() === DiscordChatFormat.MinecraftRender
   }
 }
 
